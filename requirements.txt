@@ -2,4 +2,3 @@ langgraph
 langchain-google-genai
 python-dotenv
 pytest
-watchdog
