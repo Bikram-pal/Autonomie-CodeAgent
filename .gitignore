@@ -4,3 +4,4 @@ __pycache__/
 checkpoints.sqlite
 checkpoints.sqlite-journal
 sandbox/
+.idea/
