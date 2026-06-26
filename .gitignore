@@ -5,3 +5,5 @@ checkpoints.sqlite
 checkpoints.sqlite-journal
 sandbox/
 .idea/
+.coverage
+coverage.json
