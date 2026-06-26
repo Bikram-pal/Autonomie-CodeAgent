@@ -5,7 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from tools import (read_file, write_file, list_py_files, run_pytest)
+from tools import (read_file, write_file, list_project_files, run_tests, run_tests_coverage, COVERAGE_THRESHOLD)
 
 load_dotenv()
 
@@ -24,6 +24,11 @@ class AgentState(TypedDict):
     needs_human: bool
     human_feedback: str
     aborted: bool
+    # --- New coverage memory ---
+    branch_coverage: float  # Tracks the last measured coverage %
+    needs_coverage_fix: bool  # True = tells the graph to loop back to write more tests
+    coverage_attempts: int  # Tracks how many times we've tried (to prevent infinite loops)
+    context_doc: str
 
 #model
 llm = ChatGoogleGenerativeAI(
@@ -36,7 +41,7 @@ llm = ChatGoogleGenerativeAI(
 json_llm = llm.bind(response_mime_type="application/json")
 
 def _get_codebase_context(dir: str) -> str:
-    files = list_py_files(dir)
+    files = list_project_files(dir)
     return "\n".join([f"\n--- {f} ---\n{read_file(f)}" for f in files])
 
 #nodes
@@ -47,14 +52,18 @@ def router_node(state: AgentState) -> dict:
 def test_verifier_node(state: AgentState) -> dict:
     """The Gatekeeper: Ensures tests exist before any other action is taken."""
     current_code = _get_codebase_context(state["project_dir"])
+    print("\n🔎 Verifying tests and branch coverage...")
 
-    print("\n🔎 Verifying test coverage...")
+    # --- Part 1: Ensure test files exist (Your original logic) ---
     messages = [
         ("system",
-         'You are a TDD enforcer. Review the codebase. If functions lack tests or no test files exist, output a JSON mapping of the new test files to create. Example: {"test_app.py": "import pytest..."}. If tests are fully adequate, return exactly {}'),
+         'You are a TDD enforcer. Review the codebase. If functions lack tests or no '
+         'test files exist, output a JSON mapping of the new test files to create. '
+         'Example (Python): {"test_app.py": "import pytest\\n..."}. '
+         'Example (Node/JS): {"app.test.js": "const app = require(...) \\n test(...)"}. '
+         'If tests are fully adequate, return exactly {}.'),
         ("user", f"Codebase:\n{current_code}\n\nReturn JSON:")
     ]
-
     response = json_llm.invoke(messages)
     try:
         proposed = json.loads(response.text)
@@ -65,14 +74,73 @@ def test_verifier_node(state: AgentState) -> dict:
                 write_file(os.path.join(state["project_dir"], rel_path), content)
     except Exception:
         pass
-    return {}
+
+    # --- Part 2: The New Coverage Gate ---
+    attempts = state.get("coverage_attempts", 0)
+    result = run_tests_coverage(state["project_dir"])
+    branch_cov = result.get("branch_coverage", 0.0)
+    tests_passed = result.get("passed", False)
+
+    print(f"   ↳ Branch coverage: {branch_cov}%  (threshold: {COVERAGE_THRESHOLD}%)")
+
+    # If coverage is low, tests are passing, and we haven't hit our retry limit:
+    if branch_cov < COVERAGE_THRESHOLD and tests_passed and attempts < 2:
+        print(f"   ↳ Coverage too low. Writing edge-case tests (attempt {attempts + 1}/2)...")
+
+        edge_messages = [
+            ("system",
+             'You are a TDD enforcer. Branch coverage is below the required threshold. '
+             'Write ADDITIONAL test cases specifically targeting uncovered branches: '
+             'None/null inputs, zero, negative numbers, empty strings, '
+             'boundary values, and expected exception paths. '
+             'Use Pytest for Python, Jest for JS/TS. '
+             'Return ONLY a JSON mapping of test file paths to their COMPLETE updated content. '
+             'You MUST merge with existing tests — do NOT remove any existing test cases.'),
+            ("user",
+             f"Codebase:\n{current_code}\n\n"
+             f"Current branch coverage: {branch_cov}%\n"
+             f"Return JSON:")
+        ]
+        try:
+            edge_proposed = json.loads(json_llm.invoke(edge_messages).text)
+            for rel_path, content in edge_proposed.items():
+                if content:
+                    rel_path = rel_path.removeprefix("sandbox/").removeprefix("/")
+                    write_file(os.path.join(state["project_dir"], rel_path), content)
+                    print(f"   ↳ Updated edge-case tests: {rel_path}")
+        except Exception as e:
+            print(f"   ↳ Edge-case test generation failed: {e}")
+
+        # Tell LangGraph we need to loop back and check again
+        return {
+            "needs_coverage_fix": True,
+            "coverage_attempts": attempts + 1,
+            "branch_coverage": branch_cov
+        }
+
+    # Give up gracefully after 2 retries — log a warning but don't block forever
+    if branch_cov < COVERAGE_THRESHOLD:
+        print(f"   ↳ ⚠️ Coverage still at {branch_cov}% after {attempts} attempt(s). Proceeding anyway.")
+
+    return {
+        "needs_coverage_fix": False,
+        "branch_coverage": branch_cov,
+        "coverage_attempts": attempts
+    }
 
 
 def analyze_codebase_node(state: AgentState) -> dict:
     current_code = _get_codebase_context(state["project_dir"])
+
+    # Inject the context document if it exists!
+    extra_context = ""
+    if state.get("context_doc"):
+        extra_context = f"\n\n--- SUPPLIED CONTEXT/SPEC ---\n{state['context_doc']}\n-----------------------------"
+
     messages = [
-        ("system", "Summarize relevant codebase context for a feature request."),
-        ("user", f"Codebase:\n{current_code}\n\nRequest: {state['request']}\nSummary:")
+        ("system",
+         "Summarize relevant codebase context for a feature request. If a spec/context is provided, incorporate its rules into your summary."),
+        ("user", f"Codebase:\n{current_code}{extra_context}\n\nRequest: {state['request']}\nSummary:")
     ]
     return {"intent": llm.invoke(messages).text}
 
@@ -91,10 +159,11 @@ def hitl_check_node(state: AgentState) -> dict:
     plan_text = " ".join(state.get("plan", [])).lower()
     major_signals = ["new file", "create file", "add dependency", "database"]
 
-    if not any(s in plan_text for s in major_signals):
+    # Pause if it's a feature request OR if it contains major signals
+    if state["mode"] != "request" and not any(s in plan_text for s in major_signals):
         return {"needs_human": False}
 
-    print("\n📋 Plan:")
+    print("\n📋 Implementation Plan:")
     for i, step in enumerate(state.get("plan", []), 1):
         print(f"  {i}. {step}")
 
@@ -133,7 +202,7 @@ def code_writer_node(state: AgentState) -> dict:
 
 
 def test_runner_node(state: AgentState) -> dict:
-    result = run_pytest(state["project_dir"])
+    result = run_tests(state["project_dir"])
     return {"test_output": result["output"], "test_passed": result["passed"]}
 
 
@@ -158,6 +227,8 @@ def escalator_node(state: AgentState) -> dict:
 
 #routing
 def route_after_verifier(state: AgentState) -> str:
+    if state.get("needs_coverage_fix"):
+        return "test_verifier"   # Loop back to itself!
     return "test_runner" if state["mode"] == "check" else "analyze_codebase"
 
 def route_after_test(state: AgentState) -> str:
@@ -189,6 +260,7 @@ def build_graph():
 
     g.add_edge("router", "test_verifier")
     g.add_conditional_edges("test_verifier", route_after_verifier, {
+        "test_verifier": "test_verifier",
         "test_runner": "test_runner",
         "analyze_codebase": "analyze_codebase"
     })
