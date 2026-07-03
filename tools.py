@@ -62,8 +62,11 @@ def run_tests(dir: str) -> dict:
             install_cmd = ["pip", "install"]
             no_test_str = "collected 0 items"
 
-        result = subprocess.run(cmd, cwd=dir, capture_output=True, text=True, timeout=60)
-        output = result.stdout + result.stderr
+        result = subprocess.run(
+            cmd, cwd=dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60
+        )
+        output = (result.stdout or "") + (result.stderr or "")
         passed = result.returncode == 0
 
         # Auto-heal missing dependencies dynamically for both JS and Python
@@ -105,8 +108,11 @@ def run_tests_coverage(dir: str) -> dict:
             install_cmd = ["pip", "install"]
             no_test_str = "collected 0 items"
 
-        result = subprocess.run(cmd, cwd=dir, capture_output=True, text=True, timeout=60)
-        output = result.stdout + result.stderr
+        result = subprocess.run(
+            cmd, cwd=dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60
+        )
+        output = (result.stdout or "") + (result.stderr or "")
         passed = result.returncode == 0
 
         match = re.search(missing_pkg_regex, output)
