@@ -1,8 +1,17 @@
 import subprocess
 import json
 import re
+import sys
 from pathlib import Path
 from typing import List
+
+# On Windows, npm/npx/node are .cmd shim scripts, not .exe files.
+# subprocess.run() with a list + shell=False calls CreateProcess directly,
+# which does NOT resolve .cmd/.bat via PATHEXT (only .exe/.com), so a bare
+# "npx"/"npm" raises FileNotFoundError: [WinError 2] even though the shell
+# (and `npx -v` typed manually) finds it fine. Append .cmd on win32 to fix.
+def _npm_bin(name: str) -> str:
+    return f"{name}.cmd" if sys.platform == "win32" else name
 
 #file
 def read_file(path:str) -> str:
@@ -43,9 +52,9 @@ def run_tests(dir: str) -> dict:
 
     for _ in range(2):
         if ecosystem == "node":
-            cmd = ["npm", "test"]
+            cmd = [_npm_bin("npm"), "test"]
             missing_pkg_regex = r"Cannot find module '([^']+)'"
-            install_cmd = ["npm", "install"]
+            install_cmd = [_npm_bin("npm"), "install"]
             no_test_str = "Error: no test specified"
         else:
             cmd = ["pytest", "--tb=short", "-q"]
@@ -86,9 +95,9 @@ def run_tests_coverage(dir: str) -> dict:
     for _ in range(2):
         if ecosystem == "node":
             # Jest requires --coverage flag. It outputs to coverage/coverage-summary.json
-            cmd = ["npx", "jest", "--coverage", "--coverageReporters=json-summary"]
+            cmd = [_npm_bin("npx"), "jest", "--coverage", "--coverageReporters=json-summary"]
             missing_pkg_regex = r"Cannot find module '([^']+)'"
-            install_cmd = ["npm", "install"]
+            install_cmd = [_npm_bin("npm"), "install"]
             no_test_str = "No tests found"
         else:
             cmd = ["pytest", "--tb=short", "-q", "--cov=.", "--cov-branch", "--cov-report=json:coverage.json"]
