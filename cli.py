@@ -16,14 +16,18 @@ def _blank_state(mode: str) -> dict:
     return {
         "mode": mode, "project_dir": "sandbox", "request": "",
         "intent": "", "plan": [], "proposed_changes": {},
-        "heal_instructions": "", "test_output": "", "test_passed": False,
+        "heal_instructions": [], "test_output": "", "test_passed": False,
         "retry_count": 0, "needs_human": False, "human_feedback": "",
         "aborted": False,
         # --- New coverage defaults ---
         "branch_coverage": 0.0,
         "needs_coverage_fix": False,
         "coverage_attempts": 0,
-        "context_doc": ""
+        "context_doc": "",
+        # --- Multi-fix healing defaults ---
+        "pending_fixes": [],
+        "current_fix_index": 0,
+        "fix_retry_count": 0
     }
 
 

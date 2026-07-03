@@ -141,7 +141,7 @@ Autonomie relies on a robust cyclic graph designed in LangGraph. Instead of rely
 If a plan contains keywords like `new file`, `database`, or `dependency`, the agent pauses in the CLI and waits for you to type `y` to approve, `n` to abort, or provide custom feedback to modify the plan.
 
 **Escalation Policy**
-If the self-healing loop fails to resolve an issue after 3 attempts, it triggers the `escalator` node, presenting the raw traceback to the developer and asking for a manual text hint to get the agent back on track.
+The agent now supports **multi-location self-healing**. When tests fail, it identifies every distinct bug location, then gives each location its own 3-attempt healing cycle. Only after exhausting all fixes (or all 3 attempts on a fix) does it escalate to the human. HITL is never triggered until every fix has been attempted.
 
 ---
 

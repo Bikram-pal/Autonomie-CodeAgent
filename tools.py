@@ -1,6 +1,7 @@
 import subprocess
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import List
 
@@ -35,6 +36,16 @@ def _detect_ecosystem(dir: str) -> str:
         return "node"
     return "python"
 
+
+def _resolve_cmd(cmd: list, cwd: str) -> list:
+    """Resolve executable on Windows (handles npx.cmd, npm.cmd etc.)."""
+    if Path(cmd[0]).is_absolute():
+        return cmd
+    resolved = shutil.which(cmd[0]) or shutil.which(cmd[0] + ".cmd")
+    if resolved:
+        return [resolved] + cmd[1:]
+    return cmd
+
 #tests
 def run_tests(dir: str) -> dict:
     """Ecosystem-aware test runner (Pytest or npm/Jest)"""
@@ -53,7 +64,7 @@ def run_tests(dir: str) -> dict:
             install_cmd = ["pip", "install"]
             no_test_str = "collected 0 items"
 
-        result = subprocess.run(cmd, cwd=dir, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(_resolve_cmd(cmd, dir), cwd=dir, capture_output=True, text=True, timeout=60)
         output = result.stdout + result.stderr
         passed = result.returncode == 0
 
@@ -96,7 +107,7 @@ def run_tests_coverage(dir: str) -> dict:
             install_cmd = ["pip", "install"]
             no_test_str = "collected 0 items"
 
-        result = subprocess.run(cmd, cwd=dir, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(_resolve_cmd(cmd, dir), cwd=dir, capture_output=True, text=True, timeout=60)
         output = result.stdout + result.stderr
         passed = result.returncode == 0
 

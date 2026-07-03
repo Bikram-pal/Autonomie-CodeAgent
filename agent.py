@@ -17,7 +17,7 @@ class AgentState(TypedDict):
     intent: str
     plan: List[str]
     proposed_changes: dict
-    heal_instructions: str
+    heal_instructions: List[str]
     test_output: str
     test_passed: bool
     retry_count: int
@@ -29,6 +29,10 @@ class AgentState(TypedDict):
     needs_coverage_fix: bool  # True = tells the graph to loop back to write more tests
     coverage_attempts: int  # Tracks how many times we've tried (to prevent infinite loops)
     context_doc: str
+    # --- Multi-fix healing state ---
+    pending_fixes: List[dict]
+    current_fix_index: int
+    fix_retry_count: int
 
 #model
 llm = ChatGoogleGenerativeAI(
@@ -180,7 +184,12 @@ def code_writer_node(state: AgentState) -> dict:
 
     context = f"Intent: {state.get('intent', '')}\n"
     if state.get("plan"): context += "Plan:\n" + "\n".join(state["plan"]) + "\n"
-    if state.get("heal_instructions"): context += f"Fix this error:\n{state['heal_instructions']}\n"
+    if state.get("heal_instructions"):
+        fixes = state["heal_instructions"]
+        if isinstance(fixes, list):
+            context += "Fix these errors:\n" + "\n".join(str(f) for f in fixes) + "\n"
+        else:
+            context += f"Fix this error:\n{fixes}\n"
     if state.get("human_feedback"): context += f"Human feedback: {state['human_feedback']}\n"
 
     messages = [
@@ -198,7 +207,19 @@ def code_writer_node(state: AgentState) -> dict:
         print(f"JSON parse failed: {e}")
         proposed = {}
 
-    return {"proposed_changes": proposed, "heal_instructions": "", "human_feedback": ""}
+    # After applying fixes, advance to next pending fix
+    pending = state.get("pending_fixes", [])
+    idx = state.get("current_fix_index", 0)
+    if pending and idx < len(pending):
+        return {
+            "proposed_changes": proposed,
+            "heal_instructions": [],
+            "human_feedback": "",
+            "current_fix_index": idx + 1,
+            "fix_retry_count": 0
+        }
+
+    return {"proposed_changes": proposed, "heal_instructions": [], "human_feedback": ""}
 
 
 def test_runner_node(state: AgentState) -> dict:
@@ -207,22 +228,45 @@ def test_runner_node(state: AgentState) -> dict:
 
 
 def self_healer_node(state: AgentState) -> dict:
-    retry_count = state.get("retry_count", 0) + 1
-    print(f"\n[Agent] Tests failed. Attempting to heal (Try {retry_count}/3)...")
+    pending = state.get("pending_fixes", [])
+    idx = state.get("current_fix_index", 0)
+    fix_retries = state.get("fix_retry_count", 0)
 
-    current_code = _get_codebase_context(state["project_dir"])
-    messages = [
-        ("system", "You are a debugger. Be precise: what file, what function, what exact fix?"),
-        ("user", f"Test output:\n{state['test_output']}\n\nCurrent code:\n{current_code}\n\nFix instructions:")
-    ]
-    return {"heal_instructions": llm.invoke(messages).text, "retry_count": retry_count}
+    # First failure → get the list of fixes
+    if not pending:
+        current_code = _get_codebase_context(state["project_dir"])
+        messages = [
+            ("system",
+             "You are a debugger. Return a JSON array of independent fixes. "
+             "Each object must have: {\"file\": \"path\", \"fix\": \"precise change description\"}. "
+             "Only include distinct locations that need fixing. Be exhaustive."),
+            ("user", f"Test output:\n{state['test_output']}\n\nCurrent code:\n{current_code}\n\nReturn JSON array:")
+        ]
+        try:
+            fixes = json.loads(llm.invoke(messages).text)
+            if not isinstance(fixes, list):
+                fixes = [fixes]
+        except Exception:
+            fixes = []
+        return {
+            "pending_fixes": fixes,
+            "current_fix_index": 0,
+            "fix_retry_count": 0,
+            "heal_instructions": fixes
+        }
+
+    # Subsequent retries on same fix
+    print(f"\n[Agent] Healing fix {idx+1}/{len(pending)} (Attempt {fix_retries+1}/3)...")
+    return {"fix_retry_count": fix_retries + 1}
 
 
 def escalator_node(state: AgentState) -> dict:
-    print(f"\n❌ Could not fix after {state.get('retry_count', 0)} attempts.")
+    pending = state.get("pending_fixes", [])
+    idx = state.get("current_fix_index", 0)
+    print(f"\n❌ Could not fix after exhausting 3 attempts on fix {idx+1}/{len(pending)}.")
     print(f"\nLast test output:\n{state['test_output']}")
     hint = input("\n💡 Provide a hint for the agent: ").strip()
-    return {"human_feedback": hint, "retry_count": 0}
+    return {"human_feedback": hint, "retry_count": 0, "pending_fixes": [], "current_fix_index": 0, "fix_retry_count": 0}
 
 
 #routing
@@ -235,6 +279,19 @@ def route_after_test(state: AgentState) -> str:
     if state.get("test_passed"):
         print("\n✅ All tests passed!")
         return END
+
+    pending = state.get("pending_fixes", [])
+    idx = state.get("current_fix_index", 0)
+    fix_retries = state.get("fix_retry_count", 0)
+
+    # If we have pending fixes, keep healing current one until 3 attempts exhausted
+    if pending and idx < len(pending):
+        if fix_retries < 3:
+            return "self_healer"
+        # Exhausted 3 tries on this fix → move to next fix
+        return "self_healer" if idx + 1 < len(pending) else "escalator"
+
+    # Fallback to old behavior if no pending_fixes
     return "escalator" if state.get("retry_count", 0) >= 3 else "self_healer"
 
 
