@@ -5,7 +5,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from tools import (read_file, write_file, list_project_files, run_tests, run_tests_coverage, COVERAGE_THRESHOLD)
+from tools import (read_file, write_file, list_project_files, run_tests, run_tests_coverage, COVERAGE_THRESHOLD,
+                    snapshot_sandbox, restore_last_good, write_failure_log)
 
 load_dotenv()
 
@@ -35,14 +36,41 @@ class AgentState(TypedDict):
     fix_retry_count: int
 
 #model
-llm = ChatGoogleGenerativeAI(
-    model = "gemini-3.1-flash-lite",
-    api_key = os.getenv("GEMINI_API_KEY"),
-    temperature = 0.3,
-    max_retries = 8,
-)
+# NOTE (stability fix): the LLM client used to be built at import time, which meant
+# `import agent` crashed with a pydantic ValidationError any time GEMINI_API_KEY
+# wasn't set (e.g. running tests, or importing agent.py from a script that doesn't
+# need the LLM yet). It's now created lazily on first real use.
+_llm_instance = None
 
-json_llm = llm.bind(response_mime_type="application/json")
+def _get_llm():
+    global _llm_instance
+    if _llm_instance is None:
+        _llm_instance = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite",
+            api_key=os.getenv("GEMINI_API_KEY"),
+            temperature=0.3,
+            max_retries=8,
+        )
+    return _llm_instance
+
+
+class _LazyLLM:
+    """Thin proxy so existing `llm.invoke(...)` / `json_llm.invoke(...)` call sites don't change."""
+    def __init__(self, json_mode: bool = False):
+        self._json_mode = json_mode
+
+    def invoke(self, *args, **kwargs):
+        base = _get_llm()
+        if self._json_mode:
+            base = base.bind(response_mime_type="application/json")
+        return base.invoke(*args, **kwargs)
+
+    def bind(self, *args, **kwargs):
+        return _get_llm().bind(*args, **kwargs)
+
+
+llm = _LazyLLM(json_mode=False)
+json_llm = _LazyLLM(json_mode=True)
 
 def _get_codebase_context(dir: str) -> str:
     files = list_project_files(dir)
@@ -224,6 +252,9 @@ def code_writer_node(state: AgentState) -> dict:
 
 def test_runner_node(state: AgentState) -> dict:
     result = run_tests(state["project_dir"])
+    if result["passed"]:
+        # Checkpoint: only overwrite the "last known good" snapshot once tests are green.
+        snapshot_sandbox(state["project_dir"])
     return {"test_output": result["output"], "test_passed": result["passed"]}
 
 
@@ -265,7 +296,20 @@ def escalator_node(state: AgentState) -> dict:
     idx = state.get("current_fix_index", 0)
     print(f"\n❌ Could not fix after exhausting 3 attempts on fix {idx+1}/{len(pending)}.")
     print(f"\nLast test output:\n{state['test_output']}")
-    hint = input("\n💡 Provide a hint for the agent: ").strip()
+
+    log_path = write_failure_log(state["project_dir"], pending, state.get("test_output", ""))
+    print(f"📝 Wrote failure log: {log_path}")
+
+    hint = input("\n💡 Type 'abort' to roll back to the last checkpoint, or provide a hint for the agent: ").strip()
+
+    if hint.lower() == "abort":
+        restored = restore_last_good(state["project_dir"])
+        if restored:
+            print("⏪ Rolled back sandbox to last known-good checkpoint.")
+        else:
+            print("⚠️ No checkpoint found yet — nothing to roll back to.")
+        return {"aborted": True, "pending_fixes": [], "current_fix_index": 0, "fix_retry_count": 0}
+
     return {"human_feedback": hint, "retry_count": 0, "pending_fixes": [], "current_fix_index": 0, "fix_retry_count": 0}
 
 
@@ -296,6 +340,9 @@ def route_after_test(state: AgentState) -> str:
 
 
 def route_after_hitl(state: AgentState) -> str:
+    return END if state.get("aborted") else "code_writer"
+
+def route_after_escalator(state: AgentState) -> str:
     return END if state.get("aborted") else "code_writer"
 
 
@@ -334,7 +381,7 @@ def build_graph():
     })
 
     g.add_edge("self_healer", "code_writer")
-    g.add_edge("escalator", "code_writer")
+    g.add_conditional_edges("escalator", route_after_escalator, {"code_writer": "code_writer", END: END})
 
     return g.compile(checkpointer=MemorySaver())
 

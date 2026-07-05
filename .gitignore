@@ -7,5 +7,6 @@ checkpoints.sqlite-journal
 sandbox/
 .idea/
 .coverage
+node_modules
 coverage.json
-node_module
+.autonomie_backup/

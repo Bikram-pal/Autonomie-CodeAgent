@@ -5,6 +5,9 @@ import shutil
 from pathlib import Path
 from typing import List
 
+BACKUP_ROOT = ".autonomie_backup"
+LAST_GOOD_DIR = str(Path(BACKUP_ROOT) / "last_good")
+
 #file
 def read_file(path:str) -> str:
     """reads a file"""
@@ -170,3 +173,57 @@ def run_tests_coverage(dir: str) -> dict:
         }
 
     return {"passed": False, "output": output, "branch_coverage": 0.0}
+
+
+# --- Checkpoint / Stabilization (EXPANSION_DIRECTIVES Step 5) ---
+
+def snapshot_sandbox(dir: str = "sandbox", backup_dir: str = LAST_GOOD_DIR) -> bool:
+    """
+    Copies the project dir to a 'last known good' checkpoint.
+    Called after tests pass, so we always have a working state to fall back to.
+    Returns True if a snapshot was written, False if `dir` doesn't exist.
+    """
+    src = Path(dir)
+    if not src.exists():
+        return False
+
+    dest = Path(backup_dir)
+    if dest.exists():
+        shutil.rmtree(dest, onerror=lambda f, p, e: (Path(p).chmod(0o700), f(p)))
+
+    shutil.copytree(
+        src, dest,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", "node_modules", "coverage")
+    )
+    return True
+
+
+def restore_last_good(dir: str = "sandbox", backup_dir: str = LAST_GOOD_DIR) -> bool:
+    """
+    Rolls the project dir back to the last checkpoint saved by snapshot_sandbox().
+    Returns True if a restore happened, False if no checkpoint exists yet.
+    """
+    backup = Path(backup_dir)
+    if not backup.exists():
+        return False
+
+    dest = Path(dir)
+    if dest.exists():
+        shutil.rmtree(dest, onerror=lambda f, p, e: (Path(p).chmod(0o700), f(p)))
+
+    shutil.copytree(backup, dest)
+    return True
+
+
+def write_failure_log(dir: str, attempted_fixes: list, test_output: str) -> str:
+    """
+    Writes failure_log.json into `dir` summarizing every fix that was attempted
+    before escalation/rollback, so a human can see what the agent tried.
+    """
+    log_path = Path(dir) / "failure_log.json"
+    payload = {
+        "attempted_fixes": attempted_fixes,
+        "last_test_output": test_output,
+    }
+    log_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(log_path)
